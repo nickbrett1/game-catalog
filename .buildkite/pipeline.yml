@@ -33,8 +33,14 @@ steps:
     agents:
       queue: mac-studio-linux
     env:
-      IMAGE: ghcr.io/nickbrett1/mailroom
-      CACHE_REF: ghcr.io/nickbrett1/mailroom:buildcache
+      # These two literals MUST match the GitHub repo name. Renaming the repo
+      # without changing them keeps publishing to the old GHCR path, which
+      # still pulls, so the host runs stale code behind a green pipeline.
+      IMAGE: ghcr.io/nickbrett1/game-catalog
+      # Cache ref moved with the image. First build after the move is cold-
+      # cache (full dagster install) because the old buildcache belongs to the
+      # old package.
+      CACHE_REF: ghcr.io/nickbrett1/game-catalog:buildcache
     commands:
       # Credentials are resolved from Doppler at runtime with the agent's
       # DOPPLER_TOKEN - the same channel ftn's secret scan uses. CircleCI supplied
