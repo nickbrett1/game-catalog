@@ -1,7 +1,7 @@
 [project]
-name = "mailroom"
+name = "game-catalog"
 version = "0.1.0"
-description = "Email → facts pipeline platform. Vertical #1: definitive PlayStation game catalog (owned_games store) from PSN + retailer receipts via msgvault, enriched with IGDB."
+description = "Definitive PlayStation game catalog (owned_games store) from PSN + retailer receipts via msgvault, enriched with IGDB. The catalog pshelf reads."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,7 +9,7 @@ dependencies = [
     "dagster-webserver",
     "httpx",
     "fastapi",
-    "uvicorn",  # manual-edit API (mailroom write path),
+    "uvicorn",  # manual-edit API (catalog write path),
 ]
 
 [project.optional-dependencies]
@@ -23,6 +23,10 @@ dev = [
 requires = ["setuptools>=84.2.1"]
 build-backend = "setuptools.build_meta"
 
+# NOTE: the distribution name is `game-catalog` but the importable package is
+# still `mailroom` (src/mailroom/). Renaming the Python package is deliberately
+# out of scope: it is the Dagster module path (-m mailroom.definitions) and
+# appears in every import, so it needs its own revertable commit.
 [tool.setuptools.packages.find]
 where = ["src"]
 
