@@ -126,6 +126,22 @@ CREATE TABLE IF NOT EXISTS owned_games (
     status TEXT DEFAULT 'owned',
     is_owned INTEGER DEFAULT 1,
     provenance TEXT,
+    -- Pre-order capture (memos/pre-order-ingestion). Three separate facts:
+    --   preorder_flag       = the PSN entitlement's own preorderFlag (Sony is
+    --                         authoritative that this purchase was a pre-order;
+    --                         the safety interlock so a stale IGDB date can't
+    --                         invent one).
+    --   preorder_release_ts = the STORE's expected release date, epoch SECONDS
+    --                         (NULL when unknown — never backfilled from IGDB,
+    --                         which has its own release_ts on the views).
+    --   is_preorder         = MATERIALIZED at sync/rebuild: purchased, dated and
+    --                         acquired before the expected release. Never
+    --                         computed with now() inside a view: pshelf caches on
+    --                         the DB file's mtime, and pshelf derives "still
+    --                         unreleased" itself from the dates.
+    preorder_flag INTEGER DEFAULT 0,
+    preorder_release_ts INTEGER,
+    is_preorder INTEGER DEFAULT 0,
     retire_reason TEXT,          -- set when a dup-merge retires a row (never delete)
     game_id INTEGER,             -- parent canonical game (games.id) — NULL until the
                                  -- catalog_games pass groups this ownership record under
@@ -158,6 +174,15 @@ CREATE TABLE IF NOT EXISTS games (
     provenance TEXT,
     editions TEXT,                   -- JSON array of owned-edition summaries
     is_psvr2 INTEGER DEFAULT 0,
+    -- Aggregated pre-order facts (any edition is a pre-order; the pre-order
+    -- edition's expected store release). Materialized by catalog_games from
+    -- owned_games so catalog_games can expose them without parsing editions.
+    is_preorder INTEGER DEFAULT 0,
+    preorder_release_ts INTEGER,
+    -- The exact (un-normalized) earliest acquisition timestamp — pshelf's
+    -- `acquisition_date` on catalog_games. earliest_acquisition above stays the
+    -- YYYY-MM-DD sort key the existing purchase-date sort relies on.
+    acquisition_date TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -269,7 +294,11 @@ SELECT
     g.source,
     g.is_owned,
     g.provenance,
-    m.payload AS igdb_payload,
+    -- Pre-order contract for pshelf: the materialized flag and the STORE's
+    -- expected release date (epoch seconds). Both tolerate NULL/0; no now()
+    -- and no "release_date > now()" filter — rows must exist before release.
+    g.is_preorder,
+    g.preorder_release_ts,    m.payload AS igdb_payload,
     CAST(json_extract(m.payload, '$.total_rating') AS REAL) AS rating,
     CAST(json_extract(m.payload, '$.aggregated_rating') AS REAL) AS aggregated_rating,
     CAST(json_extract(m.payload, '$.first_release_date') AS INTEGER) AS release_ts,
@@ -348,6 +377,14 @@ SELECT
     g.num_editions,
     g.purchased,
     g.earliest_acquisition,
+    -- pshelf's purchase date (the contract's third column) — the game-level
+    -- earliest acquisition across editions, same value as earliest_acquisition
+    -- (kept under both names so neither contract breaks).
+    COALESCE(g.acquisition_date, g.earliest_acquisition) AS acquisition_date,
+    -- Pre-order contract (see the catalog_views copy): materialized flag + the
+    -- store's expected release date. No now()/date filter in this view.
+    g.is_preorder,
+    g.preorder_release_ts,
     g.price,
     g.provenance,
     g.editions,
@@ -412,6 +449,19 @@ CREATE TABLE IF NOT EXISTS essentials_lineup (
 );
 CREATE INDEX IF NOT EXISTS idx_essentials_lineup_norm ON essentials_lineup(normalized_title);
 CREATE INDEX IF NOT EXISTS idx_essentials_lineup_igdb ON essentials_lineup(igdb_id);
+-- Store's expected release date for a pre-ordered product, keyed on the PSN
+-- product id (or any store sku). The entitlements payload models pre-orders
+-- (preorderFlag) but carries NO release date, and the public store endpoints no
+-- longer return product JSON, so the expected date is captured here — from a
+-- store lookup when one is available, else set manually via
+-- POST /manual/preorder-release. Never populated from IGDB (that date lives on
+-- game_metadata and surfaces as release_ts on the views).
+CREATE TABLE IF NOT EXISTS preorder_release_dates (
+    product_id TEXT PRIMARY KEY,
+    release_ts INTEGER NOT NULL,        -- epoch SECONDS
+    source TEXT NOT NULL DEFAULT 'manual',  -- manual | psn_store | psn_entitlement
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 -- Source authentication (PSN PS-App OAuth refresh token, future API sources).
 -- Token lives here (not .env) so a UI can refresh it without container edits.
@@ -544,6 +594,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "owned_games", "ownership_class", "ownership_class TEXT DEFAULT 'purchased'")
         _add_column_if_missing(conn, "owned_games", "retire_reason", "retire_reason TEXT")
         _add_column_if_missing(conn, "owned_games", "game_id", "game_id INTEGER")
+        # Pre-order capture (memos/pre-order-ingestion): all defaulted/NULL so
+        # existing rows are untouched until the next rebuild pass sets the flag.
+        _add_column_if_missing(conn, "owned_games", "preorder_flag", "preorder_flag INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "owned_games", "preorder_release_ts", "preorder_release_ts INTEGER")
+        _add_column_if_missing(conn, "owned_games", "is_preorder", "is_preorder INTEGER DEFAULT 0")
+    if "games" in tables:
+        _add_column_if_missing(conn, "games", "is_preorder", "is_preorder INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "games", "preorder_release_ts", "preorder_release_ts INTEGER")
+        _add_column_if_missing(conn, "games", "acquisition_date", "acquisition_date TEXT")
     if "essentials_lineup" in tables:
         _add_column_if_missing(conn, "essentials_lineup", "igdb_id", "igdb_id INTEGER")
     # game_stats predates the trophy-title join (created 2026-08-20 with NPWR
@@ -695,8 +754,7 @@ def upsert_owned_game(conn: sqlite3.Connection, game: dict[str, Any]) -> int:
         ).fetchone()
         if row:
             return _update_owned_game(conn, row, game)
-    key = (game.get("psn_content_id") or "", game.get("normalized_title") or "", game.get("platform") or "")
-    # Same title/format on a generic platform is the same game — a receipt row
+    key = (game.get("psn_content_id") or "", game.get("normalized_title") or "", game.get("platform") or "")    # Same title/format on a generic platform is the same game — a receipt row
     # ('playstation' — the parser emits no platform hint) merges into the
     # concrete psn_api row (physical OR digital) and vice versa. Prefer the
     # concrete row (has the content id) when both exist. Prefer OWNED rows: a
@@ -721,12 +779,14 @@ def upsert_owned_game(conn: sqlite3.Connection, game: dict[str, Any]) -> int:
         """INSERT INTO owned_games
            (title, normalized_title, platform, format, ownership_class, retailer,
             order_number, item_id, condition, psn_content_id, igdb_id,
-            acquisition_date, price, source, source_ref, status, is_owned, provenance)
+            acquisition_date, price, source, source_ref, status, is_owned,
+            provenance, preorder_flag, preorder_release_ts, is_preorder)
            VALUES (:title, :normalized_title, :platform, :format, :ownership_class,
                    :retailer, :order_number, :item_id, :condition, :psn_content_id,
                    :igdb_id, :acquisition_date, :price, :source, :source_ref,
-                   :status, :is_owned, :provenance)""",
-        game,
+                   :status, :is_owned, :provenance, :preorder_flag,
+                   :preorder_release_ts, 0)""",
+        {"preorder_flag": 0, "preorder_release_ts": None, **game},
     )
     conn.commit()
     return cur.lastrowid
@@ -743,10 +803,15 @@ def _update_owned_game(conn: sqlite3.Connection, row: sqlite3.Row, game: dict[st
              price = COALESCE(:price, price),
              ownership_class = COALESCE(:ownership_class, ownership_class),
              psn_content_id = COALESCE(:psn_content_id, psn_content_id),
+             -- preorder_flag is monotonic: a later non-pre-order re-ingest of
+             -- the same row must not erase what Sony already told us.
+             -- preorder_release_ts only fills in, never clears.
+             preorder_flag = MAX(COALESCE(:preorder_flag, 0), COALESCE(preorder_flag, 0)),
+             preorder_release_ts = COALESCE(:preorder_release_ts, preorder_release_ts),
              provenance = :provenance,
              updated_at = datetime('now')
            WHERE id = :id""",
-        {**game, "id": row["id"], "provenance": merged_prov},
+        {"preorder_flag": 0, "preorder_release_ts": None, **game, "id": row["id"], "provenance": merged_prov},
     )
     conn.commit()
     return row["id"]

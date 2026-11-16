@@ -825,6 +825,14 @@ def psn_library_item_to_game(item: dict[str, Any]) -> dict[str, Any] | None:
     else:
         platform_name = "playstation"
     is_plus, plus_class = _item_is_psplus(item)
+    # Pre-order capture (memos/pre-order-ingestion): Sony's entitlement is
+    # authoritative (preorderFlag) and activeDate is the order moment for a
+    # pre-order, so it becomes acquisition_date — the date that must never be
+    # rewritten at release. Non-pre-orders are untouched (acquisition_date
+    # stays NULL for purchase_date_backfill to date from receipts).
+    from mailroom.verticals.game_catalog.preorder import entitlement_preorder_values
+
+    pre = entitlement_preorder_values(item)
     return {
         "title": name,
         "normalized_title": normalize_title(name),
@@ -837,13 +845,15 @@ def psn_library_item_to_game(item: dict[str, Any]) -> dict[str, Any] | None:
         "condition": None,
         "psn_content_id": content_id,
         "igdb_id": None,
-        "acquisition_date": None,
+        "acquisition_date": pre.get("acquisition_date"),
         "price": None,
         "source": "ps_plus" if is_plus else "psn_api",
         "source_ref": content_id,
         "status": "owned",
         "is_owned": 1,
         "provenance": f"psn_api:{content_id}",
+        "preorder_flag": pre.get("preorder_flag", 0),
+        "preorder_release_ts": pre.get("preorder_release_ts"),
     }
 
 

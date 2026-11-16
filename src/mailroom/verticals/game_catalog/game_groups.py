@@ -311,6 +311,9 @@ def _edition_summary(row: dict[str, Any]) -> dict[str, Any]:
         "acquisition_date": row.get("acquisition_date"),
         "source": row.get("source"),
         "provenance": row.get("provenance"),
+        # Additive (existing consumers ignore unknown keys): pre-order facts.
+        "is_preorder": row.get("is_preorder") or 0,
+        "preorder_release_ts": row.get("preorder_release_ts"),
     }
 
 
@@ -386,7 +389,20 @@ def build_games(
         dates = [m["acquisition_date"] for m in members if m.get("acquisition_date")]
         sortable = [d for d in (sortable_date(x) for x in dates) if d]
         earliest = min(sortable) if sortable else None
+        # The exact timestamp for the earliest purchase (pshelf's
+        # catalog_games.acquisition_date); `earliest` stays the YYYY-MM-DD
+        # sort key. Picked from the same member so both agree.
+        dated = [(sortable_date(x), x) for x in dates if sortable_date(x)]
+        acquisition_date = min(dated, key=lambda p: p[0])[1] if dated else None
         purchased = 1 if any(m.get("ownership_class") == "purchased" for m in members) else 0
+
+        # Pre-order facts (memos/pre-order-ingestion): any edition flagged is
+        # enough to mark the game; the expected store release is the earliest
+        # among the pre-ordered editions (a re-pre-order keeps the soonest).
+        is_preorder = 1 if any(m.get("is_preorder") for m in members) else 0
+        preorder_ts = [m["preorder_release_ts"] for m in members
+                       if m.get("is_preorder") and m.get("preorder_release_ts")]
+        preorder_release_ts = min(preorder_ts) if preorder_ts else None
 
         prov: list[str] = []
         for m in members:
@@ -407,10 +423,13 @@ def build_games(
                 "num_editions": len(members),
                 "purchased": purchased,
                 "earliest_acquisition": earliest,
+                "acquisition_date": acquisition_date,
                 "price": base.get("price"),
                 "provenance": json.dumps(prov) if prov else None,
                 "editions": json.dumps([_edition_summary(m) for m in members]),
                 "is_psvr2": is_psvr2,
+                "is_preorder": is_preorder,
+                "preorder_release_ts": preorder_release_ts,
             }
         )
         report.games += 1
