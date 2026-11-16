@@ -387,6 +387,16 @@ def psn_api_owned(context: AssetExecutionContext) -> None:
         else:
             added += 1
         upsert_owned_game(conn, game)
+    # Pre-order materialization (memos/pre-order-ingestion): copy any known
+    # store release dates onto the rows (by product id), then set
+    # owned_games.is_preorder. Both are idempotent and never time-dependent.
+    from mailroom.verticals.game_catalog.preorder import (
+        apply_store_release_dates,
+        refresh_preorder_flags,
+    )
+
+    stamped = apply_store_release_dates(conn)
+    preorder_report = refresh_preorder_flags(conn)
     set_credential(
         conn, "psn", status="valid",
         last_success=datetime.now(UTC).isoformat(timespec="seconds"),
@@ -394,6 +404,10 @@ def psn_api_owned(context: AssetExecutionContext) -> None:
     )
     conn.close()
     context.log.info(f"psn_api_owned: {added} added, {confirmed} confirmed/updated ({len(titles)} library items)")
+    context.log.info(
+        f"psn_api_owned: pre-orders — {preorder_report['after']} flagged "
+        f"({stamped} store release date(s) applied)"
+    )
 
 
 @asset(required_resource_keys={"db_url"})
@@ -1797,6 +1811,15 @@ def catalog_games(context: AssetExecutionContext) -> None:
 
     conn = connect(context.resources.db_url)
     init_db(conn)
+    # Materialize pre-order flags first (idempotent, no now()): build_games then
+    # aggregates them onto the canonical game row.
+    from mailroom.verticals.game_catalog.preorder import (
+        apply_store_release_dates,
+        refresh_preorder_flags,
+    )
+
+    apply_store_release_dates(conn)
+    refresh_preorder_flags(conn)
     rows = conn.execute("SELECT * FROM owned_games WHERE is_owned = 1").fetchall()
     meta_rows = conn.execute("SELECT igdb_id, payload FROM game_metadata").fetchall()
     metadata: dict[int, dict] = {}
@@ -1826,14 +1849,16 @@ def catalog_games(context: AssetExecutionContext) -> None:
         cur = conn.execute(
             """INSERT INTO games(title, normalized_title, igdb_id, platform, platforms,
                    formats, ownership_classes, num_editions, purchased,
-                   earliest_acquisition, price, provenance, editions, is_psvr2,
+                   earliest_acquisition, acquisition_date, price, provenance, editions,
+                   is_psvr2, is_preorder, preorder_release_ts,
                    created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
             (
                 g["title"], g["normalized_title"], g["igdb_id"], g["platform"],
                 g["platforms"], g["formats"], g["ownership_classes"], g["num_editions"],
-                g["purchased"], g["earliest_acquisition"], g["price"], g["provenance"],
-                g["editions"], g["is_psvr2"],
+                g["purchased"], g["earliest_acquisition"], g["acquisition_date"],
+                g["price"], g["provenance"], g["editions"], g["is_psvr2"],
+                g["is_preorder"], g["preorder_release_ts"],
             ),
         )
         gid = cur.lastrowid

@@ -15,6 +15,7 @@ Endpoints:
   POST /manual/game/play-state       -> {state, ...identity} set Played/Unplayed/Completed for a game
   GET  /manual/review-queue          -> open (or all) dedup/manual review flags
   POST /manual/review-queue/{id}/resolve -> {decision, note?} adjudicate a flag
+  POST /manual/preorder              -> {release_date, product_id?, title?, acquisition_date?} record a pre-order
   POST /manual/psn-credential        -> {npsso} exchange -> store refresh token + session
   GET  /manual/psn-credential        -> credential status
   POST /manual/psn-cookies           -> store m.np playtime session cookies
@@ -79,6 +80,22 @@ class ReviewResolveRequest(BaseModel):
     decision: str  # e.g. 'double_purchase' | 'same_purchase' | 'not_a_duplicate'
     note: str | None = None
 
+
+class PreorderRequest(BaseModel):
+    """Record a pre-order's store facts (the fallback path when the PSN
+    library API does not surface the pre-order, or its release date).
+
+    `release_date` is the STORE's expected release (ISO date or epoch seconds);
+    `acquisition_date` is the moment the order was placed (ISO). `title` is
+    optional: when present the pre-order is also written to owned_games (a
+    purchased digital edition) so it lands in the catalog immediately.
+    """
+    release_date: str | int
+    product_id: str | None = None
+    acquisition_date: str | None = None
+    title: str | None = None
+    platform: str | None = None
+    price: str | None = None
 
 class KnownOrderItemRequest(BaseModel):
     """A game that never appeared in a receipt (anonymized Amazon confirmations).
@@ -262,6 +279,79 @@ def known_order_items() -> list[dict]:
             "SELECT * FROM known_order_items ORDER BY created_at DESC, id DESC"
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.post("/manual/preorder")
+def record_preorder(req: PreorderRequest) -> dict:
+    """Record a pre-order's store facts (memos/pre-order-ingestion).
+
+    The fallback path for anything the PSN library API does not surface: it
+    stores the STORE's expected release date for `product_id` (in
+    preorder_release_dates, so a later sync stamps it onto the owned row) and,
+    when `title` is given, writes the purchased digital edition itself with the
+    order date in acquisition_date. Then materializes is_preorder. Idempotent.
+
+    Materialize catalog_games afterwards (Jobs -> catalog_games) so the game
+    card picks up the aggregated pre-order columns.
+    """
+    from mailroom.db import upsert_owned_game
+    from mailroom.verticals.game_catalog.parsers.psn import normalize_title
+    from mailroom.verticals.game_catalog.preorder import (
+        refresh_preorder_flags,
+        set_release_date,
+        to_epoch_seconds,
+    )
+
+    release_ts = to_epoch_seconds(req.release_date)
+    if not release_ts:
+        raise HTTPException(400, "release_date must be an ISO date or epoch seconds")
+    if req.title and not req.acquisition_date:
+        raise HTTPException(400, "acquisition_date is required when title is given")
+    conn = _conn()
+    try:
+        if req.product_id:
+            set_release_date(conn, req.product_id, release_ts, source="manual")
+        owned_game_id = None
+        if req.title:
+            owned_game_id = upsert_owned_game(
+                conn,
+                {
+                    "title": req.title,
+                    "normalized_title": normalize_title(req.title),
+                    "platform": req.platform or "playstation 5",
+                    "format": "digital",
+                    "ownership_class": "purchased",
+                    "retailer": "playstation store",
+                    "order_number": None,
+                    "item_id": None,
+                    "condition": None,
+                    "psn_content_id": req.product_id,
+                    "igdb_id": None,
+                    "acquisition_date": req.acquisition_date,
+                    "price": req.price,
+                    # store-order provenance: the row came from the order, not
+                    # from the library API pull.
+                    "source": "psn_store",
+                    "source_ref": req.product_id,
+                    "status": "owned",
+                    "is_owned": 1,
+                    "provenance": f"psn_store:{req.product_id or req.title}",
+                    "preorder_flag": 1,
+                    "preorder_release_ts": release_ts,
+                },
+            )
+        report = refresh_preorder_flags(conn)
+        checkpoint_wal(conn)
+        return {
+            "status": "recorded",
+            "owned_game_id": owned_game_id,
+            "product_id": req.product_id,
+            "release_ts": release_ts,
+            "preorders": report["after"],
+            "materialize_catalog_games": bool(owned_game_id),
+        }
     finally:
         conn.close()
 
