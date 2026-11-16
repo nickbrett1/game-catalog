@@ -102,6 +102,19 @@ def apply_store_release_dates(conn: sqlite3.Connection) -> int:
     return cur.rowcount
 
 
+# Longest gap between the order date and the release that still counts as a
+# plausible pre-order when IGDB is the ONLY evidence of the release date.
+# A pre-order is placed against a release the store has already announced; a
+# gap of years means the IGDB date almost certainly belongs to a different
+# (remaster/sequel) entry than the one that was bought.
+_IGDB_PREORDER_HORIZON_DAYS = 730
+
+_IGDB_RELEASE_TS = (
+    "(SELECT CAST(json_extract(m.payload, '$.first_release_date') AS INTEGER)"
+    "   FROM game_metadata m WHERE m.igdb_id = owned_games.igdb_id)"
+)
+
+
 def refresh_preorder_flags(conn: sqlite3.Connection) -> dict[str, Any]:
     """Materialize `owned_games.is_preorder` from the stored facts.
 
@@ -110,30 +123,42 @@ def refresh_preorder_flags(conn: sqlite3.Connection) -> dict[str, Any]:
         is_preorder = 1  iff  is_owned = 1
                          and  ownership_class = 'purchased'   (never PS+ claims)
                          and  acquisition_date is set (the order moment)
-                         and  (preorder_release_ts IS NOT NULL OR preorder_flag = 1)
-                         and  acquisition_date < COALESCE(preorder_release_ts,
-                                                          IGDB first_release_date)
+                         and  a release date resolves (store override or IGDB)
+                         and  acquisition_date < that release date
+                         and  the evidence for the release date is trustworthy:
+                                - preorder_release_ts is set (store/manual), OR
+                                - Sony's preorder_flag is 1, OR
+                                - IGDB supplies it and the release is within
+                                  _IGDB_PREORDER_HORIZON_DAYS of the purchase.
 
-    The `preorder_flag` interlock means a wrong/stale IGDB date on an old game
-    can never invent a pre-order; IGDB's date only ever *confirms* a pre-order
-    Sony already declared. PS+ claimed/extra rows are excluded outright.
+    Why Sony's flag is NOT required: verified live 2026-11-16, GTA VI arrived
+    from the PSN entitlement pull with `preorderFlag = 0` even though it is an
+    unreleased pre-order (content id EP1004-PPSA01547_00-GTAVISTANDARD001,
+    ordered 2026-11-15, releasing 2026-11-18). The flag is therefore
+    *corroborating*, never necessary. What still keeps a wrong/stale IGDB date
+    from inventing a pre-order is the horizon gate above: an old purchase
+    (e.g. 2020) can only be re-flagged from an IGDB date within 730 days of it,
+    so a remaster/sequel match years later cannot vote. PS+ claimed/extra rows
+    are excluded outright.
     """
     before = conn.execute("SELECT COUNT(*) AS n FROM owned_games WHERE is_preorder = 1").fetchone()["n"]
     conn.execute(
-        """UPDATE owned_games
+        f"""UPDATE owned_games
               SET is_preorder = CASE WHEN
                       is_owned = 1
                       AND ownership_class = 'purchased'
                       AND acquisition_date IS NOT NULL
                       AND acquisition_date != ''
-                      AND (preorder_release_ts IS NOT NULL OR COALESCE(preorder_flag, 0) = 1)
+                      AND COALESCE(preorder_release_ts, {_IGDB_RELEASE_TS}) IS NOT NULL
                       AND julianday(acquisition_date) < julianday(
-                              COALESCE(
-                                  preorder_release_ts,
-                                  (SELECT CAST(json_extract(m.payload, '$.first_release_date') AS INTEGER)
-                                     FROM game_metadata m
-                                    WHERE m.igdb_id = owned_games.igdb_id)),
+                              COALESCE(preorder_release_ts, {_IGDB_RELEASE_TS}),
                               'unixepoch')
+                      AND (
+                          preorder_release_ts IS NOT NULL
+                          OR COALESCE(preorder_flag, 0) = 1
+                          OR julianday({_IGDB_RELEASE_TS}, 'unixepoch')
+                             - julianday(acquisition_date) <= {_IGDB_PREORDER_HORIZON_DAYS}
+                      )
                   THEN 1 ELSE 0 END
             WHERE is_owned = 1"""
     )

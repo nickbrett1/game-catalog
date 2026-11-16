@@ -107,8 +107,10 @@ def test_bought_after_release_is_not_a_preorder():
 
 
 def test_igdb_date_alone_cannot_invent_a_preorder():
-    """The interlock: with no store date and no Sony preorderFlag, a later IGDB
-    first_release_date must not turn an old purchase into a pre-order."""
+    """The horizon gate: with no store date and no Sony preorderFlag, a later
+    IGDB first_release_date must not turn an OLD purchase into a pre-order —
+    a release years after the purchase is a wrong/remastered match, not a
+    pre-order."""
     conn = _db()
     conn.execute(
         """INSERT INTO game_metadata(igdb_id, payload) VALUES (?, ?)""",
@@ -121,6 +123,32 @@ def test_igdb_date_alone_cannot_invent_a_preorder():
     refresh_preorder_flags(conn)
     row = conn.execute("SELECT is_preorder FROM owned_games WHERE id = ?", (oid,)).fetchone()
     assert row["is_preorder"] == 0
+    conn.close()
+
+
+def test_igdb_date_alone_flags_a_recent_preorder_when_sonys_flag_is_zero():
+    """GTA VI, live 2026-11-16: the PSN entitlement carried preorderFlag = 0 and
+    the payload no release date, so IGDB's first_release_date is the only
+    evidence. Ordered 2026-11-15, releasing 2026-11-18 -> pre-order."""
+    conn = _db()
+    conn.execute(
+        """INSERT INTO game_metadata(igdb_id, payload) VALUES (?, ?)""",
+        (52189, '{"first_release_date": 1794960000}'),
+    )  # 2026-11-18
+    oid = _owned(
+        conn, title="Grand Theft Auto VI", preorder_flag=0, preorder_release_ts=None,
+        igdb_id=52189, acquisition_date="2026-11-15",
+    )
+    refresh_preorder_flags(conn)
+    row = conn.execute(
+        "SELECT is_preorder, preorder_release_ts, acquisition_date FROM owned_games WHERE id = ?",
+        (oid,),
+    ).fetchone()
+    assert row["is_preorder"] == 1
+    # the store/override column stays NULL — IGDB's date is never copied into it
+    assert row["preorder_release_ts"] is None
+    # and the order date is never rewritten
+    assert row["acquisition_date"] == "2026-11-15"
     conn.close()
 
 
